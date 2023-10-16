@@ -1,0 +1,113 @@
+from datetime import timedelta, datetime
+import json
+import os
+import time
+from pprint import pprint
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python import PythonOperator
+import pendulum
+
+default_args = {
+    'owner': 'dag_owner',
+    'start_date': pendulum.datetime(dag_start_year, dag_start_month, dag_start_day, tz='dag_timezone'),
+    'retries': dag_no_of_retries,
+    'retry_delay': timedelta(minutes=dag_retry_delay_min),
+}
+email = Variable.get('email', '')
+if email:
+    default_args.update({
+        'email': email.split(','),
+        'email_on_failure': dag_email_on_failure,
+        'email_on_retry': dag_email_on_retry,
+    })
+
+with DAG(
+        'dag_name',
+        default_args=default_args,
+        schedule_interval='dag_schedule',
+        tags=['dag_group_name'],
+        max_active_runs=dag_max_active_runs,
+        dag_custom_param
+) as dag:
+    if hasattr(dag, "doc_md"):
+        dag.doc_md = """This DAG accepts a manual override if re-doing from a previous date/month. An example of the allowed JSON payload is: `{"run_date": "2023-06-27"}` or `{"months_ago": 2}`"""
+
+    def create_temp_job_conf(ti, **kwargs):
+        linux_timestamp = str(int(time.time()))
+        tmp_path = Variable.get('tmp_path', '')
+        if not tmp_path:
+            print('tmp_path not found')
+            exit(1)
+        else:
+            os.makedirs(os.path.join(tmp_path, 'tmp'), exist_ok=True)
+            tmp_path = os.path.join(tmp_path, 'tmp')
+        tmp_path = 'dag_tmp_job_path'.replace('tmp_path', tmp_path)
+        tmp_path = tmp_path.replace('.json', '_' + linux_timestamp + '.json')
+
+        with open('dag_job_config_path', 'r', encoding="utf-8") as file_reader:
+            content = json.load(file_reader)
+            print(f"job_description - {content['job_description']}")
+        with open(tmp_path, 'w', encoding="utf-8") as file_writer:
+            print(kwargs.get('params'))
+            if kwargs.get('params'):
+                if kwargs.get('params').get('run_date'):
+                    run_date = kwargs.get('params').get('run_date')
+                    if content['job_description']['filter'].get('days_ago') != None:
+                        delta = datetime.now() - datetime.strptime(run_date, '%Y-%m-%d')
+                        days_ago = delta.days
+                        print('days_ago', days_ago)
+                        content['job_description']['filter']['days_ago'] = days_ago
+                    else:
+                        print('Invalid config param')
+                        exit(1)
+                elif kwargs.get('params').get('months_ago'):
+                    months_ago = kwargs.get('params').get('months_ago')
+                    if content['job_description']['filter'].get('months_ago') != None:
+                        content['job_description']['filter']['months_ago'] = months_ago
+                    else:
+                        print('Invalid config param')
+                        exit(1)
+                elif kwargs.get('params', {}).get('config'):
+                    config = kwargs.get('params').get('config')
+                    content.update(config)
+                else:
+                    print('Invalid config param')
+                    exit(1)
+            pprint(content)
+            print(f'creating tmp job file - {tmp_path}')
+            json.dump(content, file_writer, indent=4)
+        ti.xcom_push(key='tmp_path', value=tmp_path)
+
+
+    t2 = PythonOperator(
+        task_id='create-temp-job-conf',
+        depends_on_past=False,
+        execution_timeout=timedelta(minutes=5),
+        python_callable=create_temp_job_conf
+    )
+
+    t3 = BashOperator(
+        task_id='run-job',
+        depends_on_past=False,
+        execution_timeout=timedelta(minutes=dag_execution_timeout_min),
+        bash_command='python3 dag_job_runner_script_path {{ti.xcom_pull(task_ids="create-temp-job-conf", key="tmp_path")}} dag_source_path {{ dag_run.external_trigger }} {{ ts }} {{ data_interval_start }} {{ data_interval_end }} {{ task_instance.start_date.strftime("%Y-%m-%dT%H:%M:%S%z") }} true'
+    )
+
+
+    def delete_temp_job_conf(ti):
+        tmp_path = ti.xcom_pull(task_ids="create-temp-job-conf", key="tmp_path")
+        print(f'deleting - {tmp_path}')
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+    t4 = PythonOperator(
+        task_id='delete-temp-job-conf',
+        depends_on_past=False,
+        execution_timeout=timedelta(minutes=5),
+        python_callable=delete_temp_job_conf
+    )
+
+    t2 >> t3 >> t4
